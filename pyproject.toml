@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dqc_simulator"
+version = "0.1.0"
+description = "SimDisQ-Net: a network-aware distributed quantum circuit simulator"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "qiskit",
+    "qiskit-aer",
+    "qiskit-ibm-runtime",
+    "matplotlib",
+    "pylatexenc",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
