@@ -1,9 +1,10 @@
 # SimDisQ-Net
 
 A network-aware distributed quantum circuit simulator. SimDisQ-Net extends
-SimDisQ, the distributed quantum circuit simulator by Y. Zhang *et al.*, with
-first-class network primitives — routing, scheduling, rerouting, purification,
-and security-aware path selection — that operate alongside circuit execution.
+[SimDisQ](https://arxiv.org/abs/2511.19791), the end-to-end distributed quantum
+circuit simulator by S. Zhang *et al.*, with first-class network primitives —
+routing, scheduling, rerouting, purification, and security-aware path
+selection — that operate alongside circuit execution.
 
 ## What's distinct
 
@@ -95,6 +96,15 @@ See `examples/` — each script is self-contained and runs in under 2 seconds:
 | `allow_reroute=True` | Allow path swap when comm qubits contested |
 | `skip_aer=False` | If `True`, return after heralded sim (fast, network-only) |
 | `output_level="summary"` | `"quiet"` / `"summary"` (default) / `"verbose"` |
+
+Purification is set as an attribute before `Execution`, per link:
+
+```python
+qc.purification = {(0, 1): {"rounds": 2}}   # {(qpu_a, qpu_b): {"rounds": N}}
+```
+
+Each round runs one BBPSSW step on that link's Bell pairs (see
+`05_purification.py`).
 
 Network metrics on the result: `result.network_metrics` — keys include
 `wall_clock`, `mean_path_risk`, `safety_score`, `request_path_risk`,
