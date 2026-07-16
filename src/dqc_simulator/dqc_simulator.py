@@ -431,7 +431,7 @@ class DQCCircuit(QuantumCircuit):
 
     def Execution(self, config, qpugroup, comm_noise=False, scheduling_algorithm="FCFS",
                   allow_reroute=True, verbose=False, skip_aer=False, output_level=None,
-                  idle_decoherence=False, wait_decoherence=False):
+                  idle_decoherence=False):
         """Run the full DQC pipeline: partition → batch → route → schedule → herald → noise → execute.
 
         Args:
@@ -474,9 +474,6 @@ class DQCCircuit(QuantumCircuit):
         self.qpugroup = qpugroup
         self.idle_decoherence = idle_decoherence
         self._idle_charge = None  # reset per run; rebuilt once lazily in merge_trans_circuits
-        # Optional: add T2 dephasing for the time a request's two data
-        # qubits spend waiting in the scheduler queue. Off by default.
-        self.wait_decoherence = wait_decoherence
         qpus = self.qpugroup.qpus
         self.purification_plan = {}
         self.purification_metrics = {}
@@ -2795,16 +2792,6 @@ class DQCCircuit(QuantumCircuit):
         throughput_metrics = {"link_metrics": {}, "total_attempts": 0, "total_time": 0.0,
                               "idle_wait_time": 0.0}
 
-        # wait_decoherence: collect each remote gate's two DATA-qubit merged indices,
-        # keyed by the MZ/MX pairing index (idx_counter). The endpoint CX of every
-        # remote gate (single- or multi-hop) lands as an MZ on the control group
-        # (operands [ctrl_q, ctrl_comm]) and an MX on the target group (operands
-        # [tgt_comm, tgt_q]); the partner-counterpart conditional gates target the
-        # OTHER endpoint's data qubit. So the four data-qubit slots touched by a pair
-        # are first_qs / target_qs at the [0]/[1] positions selected by gate name.
-        # Filled only when self.wait_decoherence is on. idx -> set(merged data qubits).
-        wait_pair_data_qubits = {}
-
         # Helper for conditional ops
         def apply_conditional_gate(gate_list, qubit, clbit):
             with new_circ.if_test((clbit, 1)):
@@ -2962,16 +2949,6 @@ class DQCCircuit(QuantumCircuit):
                     apply_conditional_gate(self.qpus[first_now].compile_z_gate(), first_qs[0], clbit_obj2)
                     
 
-                # wait_decoherence bookkeeping: record the two DATA qubits of this
-                # remote gate (MZ data = operand[0] on ctrl group; MX data = operand[1]
-                # on tgt group). first_qs / target_qs hold whichever side was seen first.
-                if getattr(self, "wait_decoherence", False):
-                    if first_instr.name == "MX":
-                        data_qs = {first_qs[1], target_qs[0]}
-                    else:  # first is MZ
-                        data_qs = {first_qs[0], target_qs[1]}
-                    wait_pair_data_qubits.setdefault(idx, set()).update(data_qs)
-
                 # 更新状态
                 paired_done.add(idx)
                 indices[now] += 1
@@ -3081,52 +3058,6 @@ class DQCCircuit(QuantumCircuit):
             step += 1
             if step > 50000:
                 raise RuntimeError(f"[Error] Possible deadlock. indices={indices}, now={now}, stack={call_stack}")
-
-        # Optional wait_decoherence: charge each request's queue wait as
-        # T2 dephasing on its two data qubits. Off by default.
-        if getattr(self, "wait_decoherence", False) and wait_pair_data_qubits:
-            nm = getattr(self, "network_metrics", {}) or {}
-            batch_wait = nm.get("request_batch_wait_time", {}) or {}
-            # Map MZ/MX pairing index -> req_id. The endpoint MZ/MX pairs are emitted
-            # in request order in step[4] (one pair per remote request), so the r-th
-            # distinct pairing index seen there is request r.
-            idx_to_req = {}
-            if len(self.step) > 4:
-                seen = []
-                for inst_obj in self.step[4].data:
-                    iname = inst_obj.operation.name
-                    if iname in ("MZ", "MX"):
-                        pidx = getattr(inst_obj.operation, "index", None)
-                        if pidx is not None and pidx not in seen:
-                            seen.append(pidx)
-                idx_to_req = {pidx: r for r, pidx in enumerate(seen)}
-
-            for pidx, data_qs in wait_pair_data_qubits.items():
-                req_id = idx_to_req.get(pidx)
-                if req_id is None:
-                    continue
-                wait = batch_wait.get(req_id, 0.0)
-                if not wait or wait <= 0:
-                    continue
-                # Verify the data qubits land on the request's own endpoints before
-                # charging them — a wrong target would silently corrupt the result.
-                req = self.request_list[req_id] if req_id < len(self.request_list) else None
-                ctrl_grp = req.get("ctrl_qpu") if req else None
-                tgt_grp = req.get("tgt_qpu") if req else None
-                for gi in data_qs:
-                    sub_i = self.merged_qubits_map.get(gi, (None,))[0]
-                    if sub_i is None:
-                        continue
-                    if req is not None and sub_i not in (ctrl_grp, tgt_grp):
-                        # Mapping mismatch: skip rather than dephase the wrong qubit.
-                        continue
-                    T1, T2 = self._qpu_coherence_times(sub_i)
-                    if not (T1 and T2 and T1 > 0 and T2 > 0):
-                        continue
-                    T2_eff = min(T2, 2.0 * T1)
-                    new_circ.append(
-                        thermal_relaxation_error(T1, T2_eff, wait).to_instruction(),
-                        [new_circ.qubits[gi]])
 
         self.result_circuit = new_circ
         self.result_circuit.qubit_group = self.step[4].qubit_group
