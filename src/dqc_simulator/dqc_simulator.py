@@ -694,12 +694,17 @@ class DQCCircuit(QuantumCircuit):
 
     def _estimate_link_fidelity(self, qpu_id1, qpu_id2):
         """
-        Raw Bell-pair fidelity from endpoint gate quality and fiber amplitude
-        damping (Werner-state AD formula):
+        Raw Bell-pair fidelity from endpoint gate quality:
 
-            F_raw = 0.5*(F_2q_A + F_2q_B) * ((1 + exp(-alpha*d/2))/2)^2
+            F_raw = 0.5*(F_2q_A + F_2q_B)
 
-        where alpha = 0.2/4.343 (km^-1) is the fiber attenuation coefficient.
+        Fiber loss is deliberately NOT charged here. It is already charged as
+        attempt failure in the link success probability (P_transmission =
+        exp(-alpha*d) in backend_params.py). Heralding post-selects on both
+        photons being detected, so a lost photon is a failed attempt that
+        retries, not a pair that survived in degraded form. Charging it again
+        here would count the same loss twice. Distance therefore costs TIME,
+        through the success probability, not fidelity.
         """
         qpu1 = self.qpugroup.get_qpu(qpu_id1) if self.qpugroup else None
         qpu2 = self.qpugroup.get_qpu(qpu_id2) if self.qpugroup else None
@@ -707,16 +712,8 @@ class DQCCircuit(QuantumCircuit):
             try:
                 p1 = BackendParams.from_backend(qpu1.backend)
                 p2 = BackendParams.from_backend(qpu2.backend)
-                distance = 0.0
-                for nb, dist in self.qpugroup.map.get(qpu_id1, []):
-                    if nb == qpu_id2:
-                        distance = float(dist)
-                        break
-                alpha = 0.2 / 4.343  # dB/km -> natural
-                survival_amp = math.exp(-alpha * distance / 2.0)
-                bell_ad_factor = ((1.0 + survival_amp) / 2.0) ** 2
                 local_quality = 0.5 * (p1.fidelity_2q + p2.fidelity_2q)
-                return min(0.999999, max(0.0, float(local_quality * bell_ad_factor)))
+                return min(0.999999, max(0.0, float(local_quality)))
             except Exception:
                 pass
 
@@ -1460,11 +1457,26 @@ class DQCCircuit(QuantumCircuit):
         request_by_pos = {r["start_pos"]: r["id"] for r in self.request_list}
 
         # === 4. 改写电路 ===
+        # Map every remote-gate index (idx_counter) to the request that owns it.
+        # Built here because this is the only scope with both req_id and idx_counter.
+        # The RemoteGate.index survives transpilation (custom attrs do not), so the
+        # per-request BENEFIT leg reads rounds via this map at circuit-merge time.
+        _rg_req_map = {}
+        _pending_rg = None  # (req_id, idx_counter_at_start_of_that_instruction)
         for inst_pos, inst_obj in enumerate(old_circ.data):
+            # Flush the previous remote instruction's index range now that
+            # idx_counter has finished advancing for it.
+            if _pending_rg is not None:
+                _pr_rq, _pr_ic0 = _pending_rg
+                for _ic in range(_pr_ic0, idx_counter):
+                    _rg_req_map[_ic] = _pr_rq
+                _pending_rg = None
             instr = inst_obj.operation
             qargs = inst_obj.qubits
             cargs = inst_obj.clbits
             req_id = request_by_pos.get(inst_pos)
+            if req_id is not None:
+                _pending_rg = (req_id, idx_counter)
             if instr.name == "cx": 
                 ctrl, tgt = qargs
                 g_ctrl = new_circ.qubit_group[old_circ.get_index(ctrl)]
@@ -1611,6 +1623,13 @@ class DQCCircuit(QuantumCircuit):
             else:
                 # 不是 CNOT 和 Mesurement，保持原样
                 new_circ.append(instr, qargs, cargs)
+
+        # Flush the final pending remote instruction's index range.
+        if _pending_rg is not None:
+            _pr_rq, _pr_ic0 = _pending_rg
+            for _ic in range(_pr_ic0, idx_counter):
+                _rg_req_map[_ic] = _pr_rq
+        self._remote_gate_req_map = _rg_req_map
 
         # --- Post-rewrite fixup: fix any cross-group CX/MX/MZ where tgt_comm ---
         # --- was set to the wrong group by the S_CX loop variable leakage.   ---
@@ -2886,11 +2905,25 @@ class DQCCircuit(QuantumCircuit):
                         # Optional: add T2 dephasing to every qubit for the batch's longest
                         # entanglement setup time. Off by default.
                         if self._idle_charge is None:
-                            _rtu = (getattr(self, "network_metrics", {}) or {}).get("request_time_used", {})
+                            _nm = getattr(self, "network_metrics", {}) or {}
+                            _rtu = _nm.get("request_time_used", {})
+                            _rbw = _nm.get("request_batch_wait_time", {})
+                            # parallel_batches hold REQUEST ids, but this dict is read
+                            # below by `idx`, a REMOTE-GATE index. Key by gate index
+                            # instead, anchoring each batch's charge at its earliest
+                            # gate so the dephasing lands at the right circuit depth.
+                            _rg_map = getattr(self, "_remote_gate_req_map", {}) or {}
+                            _req_gates = {}
+                            for _g, _rq in _rg_map.items():
+                                _req_gates.setdefault(_rq, []).append(_g)
                             self._idle_charge = {}
                             for _b in (getattr(self, "parallel_batches", []) or []):
-                                if _b:
-                                    self._idle_charge[min(_b)] = max(_rtu.get(r, 0.0) for r in _b)
+                                if not _b:
+                                    continue
+                                _charge = max(_rtu.get(r, 0.0) + _rbw.get(r, 0.0) for r in _b)
+                                _gates = [_g for r in _b for _g in _req_gates.get(r, [])]
+                                if _gates:
+                                    self._idle_charge[min(_gates)] = _charge
                         t_gate = self._idle_charge.get(idx, 0.0)
                         if t_gate and t_gate > 0:
                             for gi in range(len(new_circ.qubits)):

@@ -6,6 +6,20 @@ import numpy as np
 from dataclasses import dataclass
 
 
+# Photon-interface efficiency: collection x coupling/conversion x detection.
+# The gate fidelities alone are not a usable stand-in for the chance a chip
+# emits a detectable photon -- they give a success rate near 0.5 per attempt,
+# about 2000x too optimistic. Calibrated to Oxford 2020 (Stephenson et al.,
+# PRL 124, 110501), which measured p = 2.18e-4 at ~2 m.
+ETA_PHOTONIC = 4.429e-4
+
+# Entanglement attempt period: the optical duty cycle of one attempt, about 1 us
+# at a 1 MHz attempt rate. This is NOT the two-qubit gate time, which is a local
+# gate on the chip (970 us on IonQ Forte) and roughly 1000x too long to stand in
+# for a photon-emission cycle.
+T_ATTEMPT_PERIOD = 1e-6
+
+
 @dataclass
 class BackendParams:
     """Parameters extracted from a backend for link success-rate calculation."""
@@ -113,10 +127,10 @@ def calculate_link_success_probability(backend1, backend2, distance: float):
     P_transmission = np.exp(-alpha * d1) * np.exp(-alpha * d2)
     P_BSM = 0.5
 
-    success_prob = P_emit1 * P_emit2 * P_transmission * P_BSM
-    success_prob = float(np.clip(success_prob, 1e-6, 1.0))
+    success_prob = P_emit1 * P_emit2 * P_transmission * P_BSM * ETA_PHOTONIC
+    success_prob = float(np.clip(success_prob, 1e-12, 1.0))
 
-    t_emit = max(p1.gate_time_2q, p2.gate_time_2q)
+    t_emit = T_ATTEMPT_PERIOD
     # Photon arms travel to the heralding station — we wait for the slower one.
     # For symmetric midpoint heralding (current case), max(d1, d2) = distance/2.
     # Same expression handles asymmetric placement if d1 != d2 in the future.
